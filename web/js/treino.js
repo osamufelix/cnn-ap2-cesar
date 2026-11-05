@@ -68,7 +68,6 @@ async function atualizarDataset() {
     fichas.appendChild(ficha);
   });
 
-  if (!d.modelo_treinado) document.getElementById("preparo").open = true;   // sem modelo: mostra o passo a passo
   botaoTreinar.disabled = treinoRodando || bloqueios.length > 0;
 }
 
