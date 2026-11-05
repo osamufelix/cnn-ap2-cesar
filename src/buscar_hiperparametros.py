@@ -4,13 +4,12 @@
 import os
 import sys
 import json
-import time
 import numpy as np
 
-from src.config import MODELO_DIR, CAMINHO_HP, SEED, HP
+from src.config import MODELO_DIR, CAMINHO_HP, SEED, HP, PROCESSOS
 from src.divisao import dividir_dados
 from src.modelo import prever, decidir
-from src.treinar import carregar_dados, treinar_modelo
+from src.treinar import carregar_dados, treinar_em_paralelo
 
 # Valores sorteados em cada tentativa
 OPCOES = {
@@ -48,16 +47,17 @@ def main():
         if hp not in combinacoes:
             combinacoes.append(hp)
 
+    print(f"\nTreinando {len(combinacoes)} combinações, até {PROCESSOS} ao mesmo tempo (as linhas de época se misturam)")
+    sementes = gerador.integers(2 ** 32, size=len(combinacoes))
+    tarefas = [(X[idx_treino], y[idx_treino], X[idx_val], y[idx_val], len(classes), hp, s)
+               for hp, s in zip(combinacoes, sementes)]
     resultados = []
-    for i, hp in enumerate(combinacoes, 1):
-        print(f"\nTentativa {i}/{len(combinacoes)}: {json.dumps(hp)}")
-        inicio = time.time()
-        params, historico, limiar = treinar_modelo(X[idx_treino], y[idx_treino], X[idx_val], y[idx_val],
-                                                   len(classes), hp, gerador)
+    for i, (hp, (params, historico, limiar, segundos)) in enumerate(zip(combinacoes, treinar_em_paralelo(tarefas)), 1):
         total, acerto, impostor = nota(prever(params, X[idx_val]), y[idx_val], limiar)
         resultados.append({"hp": hp, "nota": total, "acerto": acerto, "impostor": impostor, "limiar": limiar,
-                           "epocas": len(historico["loss"]), "segundos": round(time.time() - inicio)})
-        print(f"  nota {total:.3f} (acerto {acerto:.3f} - impostor {impostor:.3f}), limiar {limiar:.3f}")
+                           "epocas": len(historico["loss"]), "segundos": segundos})
+        print(f"Tentativa {i}/{len(combinacoes)}: {json.dumps(hp)}\n"
+              f"  nota {total:.3f} (acerto {acerto:.3f} - impostor {impostor:.3f}), limiar {limiar:.3f}")
 
     resultados.sort(key=lambda r: -r["nota"])
     print(f"\n{'nota':>6} {'acerto':>7} {'impostor':>9} {'épocas':>7}  hiperparâmetros")

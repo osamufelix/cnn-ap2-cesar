@@ -147,8 +147,10 @@ def passo_adam(params, grads, estado, taxa=0.001, l2=0.0, b1=0.9, b2=0.999, eps=
 
 
 def prever(params, X, lote=256):
-    # Cossenos de cada integrante para muitas fotos, em lotes (para não usar memória demais)
-    return np.concatenate([propagar(params, X[i:i + lote])[0] for i in range(0, len(X), lote)])
+    # Cossenos de cada integrante para muitas fotos, em lotes (para não usar memória demais).
+    # Média da foto com a foto espelhada (o treino já espelha): ruído some e o cosseno do integrante certo sobe.
+    return np.concatenate([(propagar(params, X[i:i + lote])[0] + propagar(params, X[i:i + lote, :, ::-1])[0]) / 2
+                           for i in range(0, len(X), lote)])
 
 
 def calibrar_limiar(cossenos, y, percentil):

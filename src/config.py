@@ -20,7 +20,8 @@ EPOCAS       = 150    # número máximo de passadas pelos dados de treino (a par
 PACIENCIA    = 10     # o treino para se o erro na validação não melhorar por 10 épocas seguidas
 BATCH        = 32     # quantas fotos a rede vê antes de cada ajuste dos pesos
 SEED         = 42     # semente aleatória: garante o mesmo resultado a cada execução
-PERCENTIL    = 5      # limiar do "desconhecido": 95% das fotos verdadeiras da validação passam dele
+PROCESSOS    = max(1, (os.cpu_count() or 2) // 2)   # treinos em paralelo (busca e integrante de fora): ~1 por núcleo físico
+PERCENTIL    = 5     # limiar do "desconhecido": 95% das fotos verdadeiras da validação passam dele
 
 # Hiperparâmetros da CNN. A busca (python -m src.buscar_hiperparametros) grava os melhores em
 # modelo/hiperparametros.json, que substituem estes no treino normal. Apague o JSON para voltar a estes.

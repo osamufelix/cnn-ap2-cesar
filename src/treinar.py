@@ -7,10 +7,12 @@ import os
 import json
 import time
 import numpy as np
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from sklearn.metrics import confusion_matrix
+from threadpoolctl import threadpool_limits          # já vem com o scikit-learn
 
 from src.config import (DATASET_DIR, MODELO_DIR, CAMINHO_MODELO, CAMINHO_RESULTADOS, EPOCAS, PACIENCIA, BATCH, SEED,
-                        PERCENTIL, hiperparametros)
+                        PERCENTIL, PROCESSOS, hiperparametros)
 from src.dados import ler_imagem, listar_dataset, sessao_da_foto
 from src.preprocessamento import preprocessar
 from src.divisao import dividir_dados
@@ -51,13 +53,21 @@ def treinar_rede(params, X_treino, y_treino, X_val, y_val, hp, gerador):
     # Parada antecipada: se o erro na validação não melhorar por PACIENCIA épocas, para e volta aos melhores pesos.
     historico = {"loss": [], "accuracy": [], "val_loss": [], "val_accuracy": []}
     estado_adam, melhor_erro, melhores, sem_melhora = {}, np.inf, None, 0
+    # O aumento (OpenCV, solta o GIL) roda numa thread de fundo, um lote à frente do treino. Ela tem o próprio gerador:
+    # dois geradores não podem ser usados por threads diferentes ao mesmo tempo.
+    gerador_aumento = np.random.default_rng(gerador.integers(2 ** 32))
+    aumentar_lote = lambda fotos: np.array([aumentar(img, gerador_aumento) for img in fotos])   # cópias novas a cada época
+    fundo = ThreadPoolExecutor(1)
     for epoca in range(1, EPOCAS + 1):
         inicio = time.time()
         ordem = gerador.permutation(len(X_treino))
+        lotes = [ordem[i:i + BATCH] for i in range(0, len(ordem), BATCH)]
+        pronto = fundo.submit(aumentar_lote, X_treino[lotes[0]])
         soma_erro, acertos = 0.0, 0
-        for i in range(0, len(ordem), BATCH):
-            lote = ordem[i:i + BATCH]
-            x = np.array([aumentar(img, gerador) for img in X_treino[lote]])     # cópias novas a cada época
+        for j, lote in enumerate(lotes):
+            x = pronto.result()
+            if j + 1 < len(lotes):
+                pronto = fundo.submit(aumentar_lote, X_treino[lotes[j + 1]])     # prepara o próximo enquanto este treina
             cossenos, cache = propagar(params, x, hp["dropout"], gerador)        # gerador = dropout ligado
             erro, d_cossenos = cosface_entropia(cossenos, y_treino[lote], hp["s"], hp["m"])
             passo_adam(params, retropropagar(params, cache, d_cossenos), estado_adam, hp["taxa"], hp["l2"])
@@ -79,6 +89,7 @@ def treinar_rede(params, X_treino, y_treino, X_val, y_val, hp, gerador):
             if sem_melhora >= PACIENCIA:
                 print(f"Parada antecipada: {PACIENCIA} épocas sem melhora na validação.")
                 break
+    fundo.shutdown()
     params.update(melhores)                       # volta para os pesos da melhor época
     return historico
 
@@ -91,24 +102,49 @@ def treinar_modelo(X_treino, y_treino, X_val, y_val, n_classes, hp, gerador):
     return params, historico, limiar
 
 
+def _limitar_threads():
+    # Roda em cada processo filho: 1 thread de BLAS por processo, senão N processos x N threads brigam pelos núcleos
+    global _limite
+    _limite = threadpool_limits(1)
+
+
+def _tarefa(tarefa):
+    # Um treino completo num processo filho. A semente própria mantém o resultado igual a cada execução,
+    # não importa a ordem em que os filhos terminam.
+    X_treino, y_treino, X_val, y_val, n_classes, hp, semente = tarefa
+    inicio = time.time()
+    params, historico, limiar = treinar_modelo(X_treino, y_treino, X_val, y_val, n_classes, hp,
+                                               np.random.default_rng(semente))
+    return params, historico, limiar, round(time.time() - inicio)
+
+
+def treinar_em_paralelo(tarefas):
+    # Treina vários modelos independentes ao mesmo tempo (um por processo). Devolve [(params, historico, limiar,
+    # segundos)] na ordem das tarefas. Cada tarefa: (X_treino, y_treino, X_val, y_val, n_classes, hp, semente).
+    with ProcessPoolExecutor(min(PROCESSOS, len(tarefas)), initializer=_limitar_threads) as pool:
+        return list(pool.map(_tarefa, tarefas))
+
+
 def teste_integrante_de_fora(X, y, idx_treino, idx_val, idx_teste, classes, hp, gerador):
     # Como medir o "desconhecido" sem fotos de desconhecidos? Fingindo que um integrante é desconhecido:
     # treina a rede SEM ele e vê quantas fotos dele saem "desconhecido". Repete para cada integrante.
     if len(classes) < 3:
         print("  Pulado: com só 2 integrantes, tirar um deixa a rede com uma classe só (não há o que separar).")
         return []
+    renumerar = lambda yy, k: yy - (yy > k)                           # os rótulos depois de k descem uma posição
+    sem = lambda idx, k: idx[y[idx] != k]
+    print(f"Treinando {len(classes)} redes ao mesmo tempo, cada uma sem um integrante (até {PROCESSOS} em paralelo)")
+    sementes = gerador.integers(2 ** 32, size=len(classes))
+    tarefas = [(X[sem(idx_treino, k)], renumerar(y[sem(idx_treino, k)], k), X[sem(idx_val, k)],
+                renumerar(y[sem(idx_val, k)], k), len(classes) - 1, hp, sementes[k]) for k in range(len(classes))]
     resultados = []
-    for k, nome in enumerate(classes):
-        print(f"Integrante de fora {k + 1}/{len(classes)}: treinando sem {nome}")
-        sem_k = lambda idx: idx[y[idx] != k]
-        renumerar = lambda yy: yy - (yy > k)                          # os rótulos depois de k descem uma posição
-        t, v, te = sem_k(idx_treino), sem_k(idx_val), sem_k(idx_teste)
-        params, _, limiar = treinar_modelo(X[t], renumerar(y[t]), X[v], renumerar(y[v]), len(classes) - 1, hp, gerador)
+    for k, (nome, (params, _, limiar, _)) in enumerate(zip(classes, treinar_em_paralelo(tarefas))):
+        te = sem(idx_teste, k)
         fora = decidir(prever(params, X[y == k]), limiar)              # todas as fotos dele: a rede nunca o viu
         dentro = decidir(prever(params, X[te]), limiar)
         resultados.append({"integrante": nome, "fotos": int(np.sum(y == k)), "limiar": limiar,
                            "rejeitadas": float(np.mean(fora == -1)),
-                           "conhecidos_corretos": float(np.mean(dentro == renumerar(y[te])))})
+                           "conhecidos_corretos": float(np.mean(dentro == renumerar(y[te], k)))})
         print(f"  {nome}: {resultados[-1]['rejeitadas']:.1%} das fotos viraram 'desconhecido'; "
               f"os outros foram reconhecidos certo em {resultados[-1]['conhecidos_corretos']:.1%} das fotos do teste")
     return resultados
